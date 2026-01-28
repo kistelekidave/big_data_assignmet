@@ -1,3 +1,4 @@
+# Disclaimer: Part of this code was David's code, I just added the game phases
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
     col, split, posexplode, regexp_extract,
@@ -20,12 +21,37 @@ spark = (
 # ----------------------------
 # Read data
 # ----------------------------
-chess = spark.read.parquet(
-    "/data/doina/Lichess/lichess_db_standard_rated_2023-01.parquet"
-)
+chess_2017 = spark.read.parquet("/data/doina/Lichess/lichess_db_standard_rated_2018-*.parquet")
+chess_2017 = chess_2017.filter(col("Moves").contains("%eval")).withColumn("year", lit(2018))
 
-# Only games with evals
-chess = chess.filter(col("Moves").contains("%eval"))
+chess_2018 = spark.read.parquet("/data/doina/Lichess/lichess_db_standard_rated_2018-*.parquet")
+chess_2018 = chess_2018.filter(col("Moves").contains("%eval")).withColumn("year", lit(2018))
+
+chess_2019 = spark.read.parquet("/data/doina/Lichess/lichess_db_standard_rated_2019-*.parquet")
+chess_2019 = chess_2019.filter(col("Moves").contains("%eval")).withColumn("year", lit(2019))
+
+chess_2020 = spark.read.parquet("/data/doina/Lichess/lichess_db_standard_rated_2020-*.parquet")
+chess_2020 = chess_2020.filter(col("Moves").contains("%eval")).withColumn("year", lit(2020))
+
+chess_2021 = spark.read.parquet("/data/doina/Lichess/lichess_db_standard_rated_2021-*.parquet")
+chess_2021 = chess_2021.filter(col("Moves").contains("%eval")).withColumn("year", lit(2021))
+
+chess_2022 = spark.read.parquet("/data/doina/Lichess/lichess_db_standard_rated_2022-*.parquet")
+chess_2022 = chess_2022.filter(col("Moves").contains("%eval")).withColumn("year", lit(2022))
+
+chess_2023 = spark.read.parquet("/data/doina/Lichess/lichess_db_standard_rated_2023-*.parquet")
+chess_2023 = chess_2023.filter(col("Moves").contains("%eval")).withColumn("year", lit(2023))
+
+# Combine them all, eval moves already selected
+chess = (
+    chess_2017
+    .union(chess_2018)
+    .union(chess_2019)
+    .union(chess_2020)
+    .union(chess_2021)
+    .union(chess_2022)
+    .union(chess_2023)
+)
 
 # ----------------------------
 # Create stable game_id
@@ -46,7 +72,8 @@ moves = chess.select(
     "Moves",
     "WhiteElo",
     "BlackElo",
-    "TimeControl"
+    "TimeControl",
+    "year"
 )
 
 moves = moves.withColumn(
@@ -106,9 +133,8 @@ moves = moves.withColumn(
     )
 )
 
-# ----------------------------
-# Detect captures and king moves
-# ----------------------------
+# New code starts here
+# Get all moves that with either a capture or a king move
 moves = moves.withColumn(
     "is_capture",
     col("move_notation").contains("x")
@@ -119,9 +145,7 @@ moves = moves.withColumn(
     col("move_notation").startswith("K")
 )
 
-# ----------------------------
-# Count cumulative captures and king moves per game and player
-# ----------------------------
+# Count cumulative captures and king moves per game per player
 w_game_cumulative = (
     Window
     .partitionBy("game_id")
@@ -129,13 +153,13 @@ w_game_cumulative = (
     .rowsBetween(Window.unboundedPreceding, Window.currentRow)
 )
 
-# Total captures in the game so far
+# Get the total captures in the game so far, to determine the phase
 moves = moves.withColumn(
     "total_captures",
     sum(when(col("is_capture"), 1).otherwise(0)).over(w_game_cumulative)
 )
 
-# Count king moves per player
+# Get the total king moves in the game so far, to determine the phase
 w_player_cumulative = (
     Window
     .partitionBy("game_id", "player")
@@ -161,10 +185,7 @@ moves = moves.withColumn(
     max(col("player_king_moves")).over(w_game_king_check)
 )
 
-# ----------------------------
-# Determine game stage (with no going back)
-# ----------------------------
-# Beginning -> Middle (when 5+ captures) -> End (when any king moved 2+ times)
+# Determine the game stage (see report for explanation)
 moves = moves.withColumn(
     "game_stage_raw",
     when(col("max_king_moves_so_far") >= 2, lit("end"))
@@ -172,10 +193,7 @@ moves = moves.withColumn(
     .otherwise(lit("beginning"))
 )
 
-# Ensure we never go backwards (beginning -> middle -> end only)
-# Once we reach a stage, we stay there or move forward
-stage_order = {"beginning": 1, "middle": 2, "end": 3}
-
+# Rename the moves stages so we can take the max
 moves = moves.withColumn(
     "stage_numeric",
     when(col("game_stage_raw") == "beginning", lit(1))
@@ -183,13 +201,13 @@ moves = moves.withColumn(
     .when(col("game_stage_raw") == "end", lit(3))
 )
 
-# Take the maximum stage reached so far (can only increase, never decrease)
+# Take the maximum stage reached so far
 moves = moves.withColumn(
     "max_stage_so_far",
     max(col("stage_numeric")).over(w_game_cumulative)
 )
 
-# Convert back to text
+# Convert back to text, so all phases are correct
 moves = moves.withColumn(
     "game_stage",
     when(col("max_stage_so_far") == 1, lit("beginning"))
@@ -197,7 +215,7 @@ moves = moves.withColumn(
     .otherwise(lit("end"))
 )
 
-
+# End new code
 
 # ----------------------------
 # Clock to seconds
@@ -278,7 +296,8 @@ final_moves = moves.select(
     "accuracy",
     "time_spent",
     "TimeControl",
-    "game_stage"
+    "game_stage",
+    "year"
 )
 
 
@@ -290,19 +309,20 @@ binned_elo = (
     .withColumn("time_bin", floor(col("time_spent")))
     .withColumn(
         "elo_band",
-        when(col("player_elo") < 1400, "<1400")
-        .when(col("player_elo").between(1400, 1999), "1400–1999")
-        .otherwise("2000+")
+        when(col("player_elo") < 1400, "beginner")
+        .when(col("player_elo").between(1400, 1999), "intermediate")
+        .otherwise("expert")
     )
-    .groupBy("elo_band", "time_bin", "game_stage")  # Added game_stage here
+    .groupBy("year", "elo_band", "time_bin", "game_stage")
     .agg(
         avg("accuracy").alias("avg_accuracy"),
-        count("*").alias("n_moves")
+        count("*").alias("n_moves"),           # number of moves in bin
+        sum(lit(1)).alias("total_games")       # total games in this aggregation
     )
-    .orderBy("elo_band", "time_bin", "game_stage")  # Added game_stage here
+    .orderBy("year", "elo_band", "time_bin", "game_stage")
 )
 
-binned_elo.coalesce(1).write \
+binned_elo.write \
     .mode("overwrite") \
     .option("header", "true") \
-    .csv("binned_accuracy_vs_time_elo")
+    .csv("binned_accuracy_vs_time_elo_by_year")
